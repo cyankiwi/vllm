@@ -151,8 +151,9 @@ def _bf16_mla_sparse_kernel(
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 
-    # rescaling
-    acc /= e_sum[:, None]
+    # Fully padded rows must produce zero, not NaN from 0 / 0.
+    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
+    acc /= e_sum_safe[:, None]
 
     max_logits = e_max * LOGE2
     # calculate lse

@@ -12,6 +12,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
@@ -28,6 +29,9 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
 from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
+from vllm.model_executor.layers.quantization.compressed_tensors import (
+    compressed_tensors,
+)
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
@@ -158,13 +162,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
-        # KDA projections remain BF16 because fp8 checkpoints omit their scales.
-        saved_quant_config = vllm_config.quant_config
-        try:
-            vllm_config.quant_config = None
-            super().__init__(config, vllm_config, prefix)
-        finally:
-            vllm_config.quant_config = saved_quant_config
+        super().__init__(config, vllm_config, prefix)
+        self.unfused_projections = isinstance(
+            self.quant_config, compressed_tensors.CompressedTensorsConfig
+        )
+        if not self.unfused_projections:
+            # Native FP8 checkpoints omit scales for these BF16 projections.
+            self.quant_config = None
 
         self.head_dim = config.linear_head_dim
         self.num_heads = config.linear_num_heads
@@ -175,25 +179,67 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(projection_size, self.tp_size)
 
-        # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
-        # Order matches checkpoint's fused_qkvbfg_a_proj convention.
-        # Shards 4 (f_a) and 5 (g_a) are replicated across TP ranks.
-        self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
-            self.hidden_size,
-            [
-                projection_size,  # q (shard 0)
-                projection_size,  # k (shard 1)
-                projection_size,  # v (shard 2)
-                self.num_heads,  # b (shard 3)
-                self.head_dim,  # f_a (shard 4, replicated)
-                self.head_dim,  # g_a (shard 5, replicated)
-            ],
-            replicated_shard_ids=(4, 5),
-            tp_size=self.tp_size,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvbfg_a",
-        )
+        if self.unfused_projections:
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                projection_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.q_proj",
+            )
+            self.k_proj = ColumnParallelLinear(
+                self.hidden_size,
+                projection_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.k_proj",
+            )
+            self.v_proj = ColumnParallelLinear(
+                self.hidden_size,
+                projection_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.v_proj",
+            )
+            self.b_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.b_proj",
+            )
+            self.f_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.f_a_proj",
+            )
+            self.g_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.g_a_proj",
+            )
+        else:
+            # Preserve the native fused fast path and its replicated shard loader.
+            self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
+                self.hidden_size,
+                [
+                    projection_size,
+                    projection_size,
+                    projection_size,
+                    self.num_heads,
+                    self.head_dim,
+                    self.head_dim,
+                ],
+                replicated_shard_ids=(4, 5),
+                tp_size=self.tp_size,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_qkvbfg_a",
+            )
 
         self.f_b_proj = ColumnParallelLinear(
             self.head_dim,
@@ -288,17 +334,29 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
-        # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
-        projected = self.in_proj_qkvbfg_a(hidden_states)[0]
-        qkv, beta_raw, f_a, g_a = projected.split(
-            [
-                3 * self.local_projection_size,
-                self.local_num_heads,
-                self.head_dim,
-                self.head_dim,
-            ],
-            dim=-1,
-        )
+        if self.unfused_projections:
+            qkv = torch.cat(
+                (
+                    self.q_proj(hidden_states)[0],
+                    self.k_proj(hidden_states)[0],
+                    self.v_proj(hidden_states)[0],
+                ),
+                dim=-1,
+            )
+            beta_raw = self.b_proj(hidden_states)[0]
+            f_a = self.f_a_proj(hidden_states)[0]
+            g_a = self.g_a_proj(hidden_states)[0]
+        else:
+            projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+            qkv, beta_raw, f_a, g_a = projected.split(
+                [
+                    3 * self.local_projection_size,
+                    self.local_num_heads,
+                    self.head_dim,
+                    self.head_dim,
+                ],
+                dim=-1,
+            )
 
         # Beta stays raw (bf16) here: the recurrent kernel sigmoids it in fp32
         # at load (SIGMOID_BETA), and only the chunked prefill path needs the

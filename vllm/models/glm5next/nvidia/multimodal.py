@@ -633,28 +633,52 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
     def get_hf_processor(self, **kwargs: object):
         return self._glm5_hf_processor
 
-    def _processor_pixel_budget(self, proc) -> tuple[int, int]:
+    def _processor_pixel_budget(
+        self, proc, modality: str | None = None
+    ) -> tuple[int, int]:
         from vllm.transformers_utils.processors.glm5next import _pixel_budget
 
+        mm_kwargs = self.ctx.get_merged_mm_kwargs({}, modality=modality)
+        min_tokens = mm_kwargs.get("min_image_tokens")
+        max_tokens = mm_kwargs.get("max_image_tokens")
+        if min_tokens is None:
+            min_tokens = proc.min_image_tokens
+        if max_tokens is None:
+            max_tokens = proc.max_image_tokens
+        if min_tokens is not None:
+            min_tokens = int(min_tokens)
+        if max_tokens is not None:
+            max_tokens = int(max_tokens)
         return _pixel_budget(
-            proc.min_image_tokens,
-            proc.max_image_tokens,
+            min_tokens,
+            max_tokens,
             proc.patch_size,
             proc.merge_size,
             proc.temporal_patch_size,
         )
 
     def _get_image_max_pixels(self) -> int:
-        mm_kwargs = self.ctx.get_merged_mm_kwargs({})
+        mm_kwargs = self.ctx.get_merged_mm_kwargs({}, modality="image")
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
-        return self._processor_pixel_budget(self.get_hf_processor().image_processor)[1]
+        return self._processor_pixel_budget(
+            self.get_hf_processor().image_processor, "image"
+        )[1]
+
+    def get_num_frames_with_most_features(
+        self, seq_len: int, mm_counts: Mapping[str, int]
+    ) -> int:
+        if not mm_counts.get("video", 0):
+            return 1
+        return super().get_num_frames_with_most_features(seq_len, mm_counts)
 
     def _get_video_max_pixels(self) -> int:
-        mm_kwargs = self.ctx.get_merged_mm_kwargs({})
+        mm_kwargs = self.ctx.get_merged_mm_kwargs({}, modality="video")
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
-        return self._processor_pixel_budget(self.get_hf_processor().video_processor)[1]
+        return self._processor_pixel_budget(
+            self.get_hf_processor().video_processor, "video"
+        )[1]
 
     def _get_vision_info(
         self,

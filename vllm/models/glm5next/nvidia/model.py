@@ -42,6 +42,9 @@ from vllm.model_executor.layers.mhc import (
     hc_expand,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.compressed_tensors import (
+    compressed_tensors,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     scaled_dequantize,
@@ -68,6 +71,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -327,7 +331,13 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                quant_config=(
+                    quant_config
+                    if isinstance(
+                        quant_config, compressed_tensors.CompressedTensorsConfig
+                    )
+                    else None
+                ),
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=config.mla_nope,
@@ -759,6 +769,9 @@ class Glm5NextModel(nn.Module):
 
         for args in weights:
             name, loaded_weight = args[:2]
+            name = name.replace(".self_attn.forget_gate.", ".self_attn.")
+            name = name.replace(".attn_hc.", ".hc_attn_")
+            name = name.replace(".ffn_hc.", ".hc_ffn_")
             kwargs: dict = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -769,6 +782,18 @@ class Glm5NextModel(nn.Module):
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
+                continue
+
+            if name.endswith(".self_attn.conv1d.weight"):
+                for projection, tensor in zip(
+                    ("q", "k", "v"), loaded_weight.chunk(3, dim=0)
+                ):
+                    target = name.replace(
+                        ".conv1d.weight", f".{projection}_conv1d.weight"
+                    )
+                    param = params_dict[target]
+                    param.weight_loader(param, tensor)
+                    loaded_params.add(target)
                 continue
 
             # Handle FP8 indexer WK: dequantize to BF16 for fusion with
@@ -794,8 +819,18 @@ class Glm5NextModel(nn.Module):
             ):
                 continue
 
-            # Pad kv_a_proj_with_mqa for NoPE models
-            if kv_a_pad_size > 0 and ".kv_a_proj_with_mqa." in name:
+            # Native BF16/raw-FP8 weights keep the historical weight padding.
+            # A shape-matched source destination uses CT activation padding,
+            # including when that projection is explicitly ignored by CT.
+            if (
+                kv_a_pad_size > 0
+                and ".kv_a_proj_with_mqa." in name
+                and name.endswith(".weight")
+                and (
+                    name not in params_dict
+                    or params_dict[name].size() != loaded_weight.size()
+                )
+            ):
                 pad = torch.zeros(
                     kv_a_pad_size,
                     *loaded_weight.shape[1:],
@@ -816,7 +851,9 @@ class Glm5NextModel(nn.Module):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
-                # QKV fusion: skip if fused module doesn't exist in model
+                # Prefer a real source-named destination over a missing fusion.
+                if name in params_dict and name_mapped not in params_dict:
+                    continue
                 if param_name == ".fused_qkv_a_proj" and name_mapped not in params_dict:
                     continue
                 name = name_mapped
@@ -889,6 +926,15 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".self_attn.forget_gate.": ".self_attn.",
+            ".attn_hc.": ".hc_attn_",
+            ".ffn_hc.": ".hc_ffn_",
+        }
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -974,7 +1020,7 @@ class Glm5NextForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -985,19 +1031,26 @@ class Glm5NextForCausalLM(
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
 ):
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "lm_head.": "language_model.lm_head.",
+            "model.language_model.": "language_model.model.",
+            "model.visual.": "visual.",
+        },
+        orig_to_new_substr={
+            ".self_attn.forget_gate.": ".self_attn.",
+            ".attn_hc.": ".hc_attn_",
+            ".ffn_hc.": ".hc_ffn_",
+        },
+    )
+
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as
     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
     # cache); the mamba-state classmethods delegate to the text model.
     has_inner_state: ClassVar[Literal[True]] = True
     is_hybrid: ClassVar[Literal[True]] = True
-
-    # NOTE: weight-prefix mapping is inherited from Glm4vForConditionalGeneration
-    # (``model.visual.`` -> ``visual.``, ``model.language_model.`` ->
-    # ``language_model.model.``, ``lm_head.`` -> ``language_model.lm_head.``),
-    # matching the GLM-OCR / GLM-4V serialization convention. If the real
-    # checkpoint's safetensors keys differ (e.g. ``language_model.model.`` with
-    # no outer ``model.``), override ``hf_to_vllm_mapper`` accordingly.
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
@@ -1222,9 +1275,14 @@ def _try_load_fp8_attn_proj(
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
     target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
-    # If the model actually kept this projection in FP8, let the normal path
-    # handle it (it has a weight_scale_inv param).
-    if target_s in params_dict:
+    # Native FP8 uses weight_scale_inv; CT owns weight_scale and must be loaded
+    # by the source projection's quantization-aware loader.
+    source_prefix = name.rsplit(".", 1)[0]
+    if (
+        target_s in params_dict
+        or f"{layer_prefix}.{target_base}.weight_scale" in params_dict
+        or f"{source_prefix}.weight_scale" in params_dict
+    ):
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})

@@ -30,6 +30,7 @@ class MLAModules:
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
     g_proj: torch.nn.Module | None = None
+    q_a_proj: torch.nn.Module | None = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -82,6 +83,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
         self.fused_qkv_a_proj = mla_modules.fused_qkv_a_proj
+        self.q_a_proj = mla_modules.q_a_proj
         self.kv_a_proj_with_mqa = mla_modules.kv_a_proj_with_mqa
         self.q_a_layernorm = mla_modules.q_a_layernorm
         self.q_b_proj = mla_modules.q_b_proj
@@ -162,9 +164,6 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         kv_lora = None
 
         if self.q_lora_rank is not None:
-            assert self.fused_qkv_a_proj is not None, (
-                "fused_qkv_a_proj is required when q_lora_rank is not None"
-            )
             assert self.q_a_layernorm is not None, (
                 "q_a_layernorm is required when q_lora_rank is not None"
             )
@@ -172,11 +171,36 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 "q_b_proj is required when q_lora_rank is not None"
             )
 
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            q_c, kv_lora = qkv_lora.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
+            if self.fused_qkv_a_proj is not None:
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                q_c, kv_lora = qkv_lora.split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
+                )
+            elif self.q_a_proj is not None and self.kv_a_proj_with_mqa is not None:
+                q_c = self.q_a_proj(hidden_states)[0]
+                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+                expected_width = self.kv_lora_rank + self.qk_rope_head_dim
+                if (
+                    self.rotary_emb is None
+                    and self.qk_rope_head_dim > 0
+                    and kv_lora.shape[-1] == self.kv_lora_rank
+                ):
+                    kv_lora = torch.nn.functional.pad(
+                        kv_lora, (0, self.qk_rope_head_dim)
+                    )
+                elif kv_lora.shape[-1] != expected_width:
+                    raise ValueError(
+                        "Unfused kv_a_proj_with_mqa output width must equal "
+                        f"kv_lora_rank ({self.kv_lora_rank}) for NoPE or "
+                        "kv_lora_rank + qk_rope_head_dim "
+                        f"({expected_width}); got {kv_lora.shape[-1]}"
+                    )
+            else:
+                raise ValueError(
+                    "q-LoRA requires fused_qkv_a_proj or both q_a_proj and "
+                    "kv_a_proj_with_mqa"
+                )
             q_proj_layer = self.q_b_proj
             if not self.fuse_qkv_rmsnorm:
                 q_c = self.q_a_layernorm(q_c)

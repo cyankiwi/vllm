@@ -22,6 +22,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.compressed_tensors import (
+    compressed_tensors,
+)
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.layers.sparse_attn_indexer_kpool import SparseAttnIndexerKpool
 from vllm.model_executor.models.deepseek_v2 import (
@@ -443,7 +446,31 @@ class Glm5NextMLAAttention(nn.Module):
         # otherwise default to hidden_size (used in Eagle3 Deepseek with MLA)
         proj_input_size = input_size if input_size is not None else self.hidden_size
 
-        if self.q_lora_rank is not None:
+        ct_projections = isinstance(
+            quant_config, compressed_tensors.CompressedTensorsConfig
+        )
+        self.fused_qkv_a_proj: nn.Module | None = None
+        self.q_a_proj: nn.Module | None = None
+        self.kv_a_proj_with_mqa: nn.Module | None = None
+        if self.q_lora_rank is not None and ct_projections:
+            self.q_a_proj = ReplicatedLinear(
+                proj_input_size,
+                self.q_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_a_proj",
+            )
+            kv_a_output_size = self.kv_lora_rank
+            if not skip_rope:
+                kv_a_output_size += self.qk_rope_head_dim
+            self.kv_a_proj_with_mqa = ReplicatedLinear(
+                proj_input_size,
+                kv_a_output_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.kv_a_proj_with_mqa",
+            )
+        elif self.q_lora_rank is not None:
             self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(
                 proj_input_size,
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -551,12 +578,8 @@ class Glm5NextMLAAttention(nn.Module):
             kv_b_proj=self.kv_b_proj,
             rotary_emb=self.rotary_emb,
             o_proj=self.o_proj,
-            fused_qkv_a_proj=self.fused_qkv_a_proj
-            if self.q_lora_rank is not None
-            else None,
-            kv_a_proj_with_mqa=self.kv_a_proj_with_mqa
-            if self.q_lora_rank is None
-            else None,
+            fused_qkv_a_proj=self.fused_qkv_a_proj,
+            kv_a_proj_with_mqa=self.kv_a_proj_with_mqa,
             q_a_layernorm=self.q_a_layernorm if self.q_lora_rank is not None else None,
             q_b_proj=self.q_b_proj if self.q_lora_rank is not None else None,
             q_proj=self.q_proj if self.q_lora_rank is None else None,
@@ -564,6 +587,7 @@ class Glm5NextMLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            q_a_proj=self.q_a_proj,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(

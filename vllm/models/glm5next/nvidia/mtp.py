@@ -21,7 +21,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -208,6 +208,19 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "language_model.model.": "model.",
+        },
+        orig_to_new_substr={
+            ".self_attn.forget_gate.": ".self_attn.",
+            ".attn_hc.": ".hc_attn_",
+            ".ffn_hc.": ".hc_ffn_",
+        },
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -317,12 +330,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            # Multimodal (Glm5NextForConditionalGeneration) checkpoints prefix
-            # the text-tower weights with "model.language_model."; the MTP head
-            # is built as a text-only model (model.layers.*), so strip the
-            # prefix to match.
-            if name.startswith("model.language_model."):
-                name = name.replace("model.language_model.", "model.", 1)
+            name = self.hf_to_vllm_mapper._map_name(name)
+            if name is None:
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -358,6 +368,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
+                if name in params_dict and name_mapped not in params_dict:
+                    continue
                 if (
                     param_name == "fused_qkv_a_proj"
                 ) and name_mapped not in params_dict:
