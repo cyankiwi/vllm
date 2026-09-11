@@ -797,6 +797,90 @@ class K2HorizonMoVAAttention(nn.Module):
             block_shape=None,
         )
 
+        # Populated by pack_quantized_v_experts() when the checkpoint stores the
+        # MoVA value experts in compressed-tensors packed-int4 form.
+        self._mova_w1_shape = w1_shape
+        self._mova_config_M = vllm_config.scheduler_config.max_num_batched_tokens
+        self._mova_config_dtype = vllm_config.model_config.dtype
+        self.v_experts_qweight: torch.Tensor | None = None
+        self.v_experts_scale: torch.Tensor | None = None
+        self.v_experts_zp: torch.Tensor | None = None
+        self.v_experts_group_size: int | None = None
+
+    def pack_quantized_v_experts(self) -> bool:
+        """Fold packed-int4 MoVA value experts into fused-MoE kernel layout.
+
+        ``compute_mova_v_sparse`` stacks ``expert.weight``, which only exists on
+        unquantized layers.  When the checkpoint quantizes
+        ``self_attn.v_experts.*`` (compressed-tensors ``pack-quantized``), each
+        expert instead carries ``weight_packed`` / ``weight_scale`` /
+        ``weight_zero_point``.  Rather than dequantizing to bf16 (which would
+        forfeit the memory saving), convert once into the layout the existing
+        ``use_int4_w4a16`` Triton path already understands:
+
+          * ``w1``       -> ``[E, N, K // 2]`` uint8, low nibble = even k
+          * ``w1_scale`` -> ``[E, N, K // group]``
+          * ``w1_zp``    -> ``[E, N // 2, K // group]`` uint8, packed along N
+
+        compressed-tensors packs 8 values per int32 sequentially along K with
+        little-endian nibbles and a +8 storage bias, so ``weight_packed`` viewed
+        as uint8 is already the required byte layout; only the zero points
+        (packed along N) need unpacking and re-packing.
+
+        Returns True when a conversion happened.  Must run after weight loading
+        and before ``process_weights_after_loading``, since it consumes the raw
+        checkpoint parameters and then drops the per-expert modules.
+        """
+        if self.v_experts is None or len(self.v_experts) == 0:
+            return False
+        if hasattr(self.v_experts[0], "weight"):
+            return False  # unquantized: keep the existing bf16 stacking path
+        if not hasattr(self.v_experts[0], "weight_packed"):
+            raise ValueError(
+                "MoVA v_experts are neither unquantized nor compressed-tensors "
+                "packed-int4; this quantization format is not supported."
+            )
+
+        from compressed_tensors.compressors.pack_quantized.helpers import (
+            unpack_from_int32,
+        )
+
+        E = len(self.v_experts)
+        N = self.kv_size
+        qweights, scales, zps = [], [], []
+        group_size = None
+        for expert in self.v_experts:
+            packed = expert.weight_packed.data
+            scale = expert.weight_scale.data
+            K = packed.shape[1] * 8
+            if group_size is None:
+                group_size = K // scale.shape[1]
+            # int32 nibbles (k = 8m..8m+7, little-endian) == uint8 [N, K // 2]
+            qweights.append(packed.contiguous().view(torch.uint8).view(N, K // 2))
+            scales.append(scale.to(self._mova_config_dtype))
+
+            zp = getattr(expert, "weight_zero_point", None)
+            if zp is not None:
+                # zero points are packed 8-per-int32 along N (packed_dim=0)
+                zp_u = unpack_from_int32(
+                    zp.data, 4, torch.Size([N, K // group_size]), packed_dim=0
+                )
+                zp_u = (zp_u.to(torch.int16) + 8).clamp(0, 15).to(torch.uint8)
+                zps.append(zp_u[1::2, :] * 16 + zp_u[0::2, :])
+
+        self.v_experts_qweight = torch.stack(qweights, dim=0).contiguous()
+        self.v_experts_scale = torch.stack(scales, dim=0).contiguous()
+        # Symmetric checkpoints need no zero point: the kernel's default bias of
+        # 8 already matches the +8 storage bias used by compressed-tensors.
+        self.v_experts_zp = (
+            torch.stack(zps, dim=0).contiguous() if len(zps) == E else None
+        )
+        self.v_experts_group_size = group_size
+        # Drop the per-expert modules so their weights are freed and their quant
+        # methods do not re-process (e.g. repack) tensors we have consumed.
+        self.v_experts = None
+        return True
+
     def compute_mova_v_sparse(self, hidden_states):
         router_logits, _ = self.v_router(hidden_states)
 
@@ -807,6 +891,45 @@ class K2HorizonMoVAAttention(nn.Module):
             top_k=self.num_experts_per_tok,
             scaling_factor=self.router_scaling_factor,
         )
+
+        if self.v_experts_qweight is not None:
+            block_shape = [0, self.v_experts_group_size]
+            # The wna16 CUDA/Triton choice is made per call from the actual
+            # token count, and the CUDA kernel caps BLOCK_SIZE_M at 64, so the
+            # tile config must be selected per call rather than cached for
+            # max_num_batched_tokens (as the unquantized path can do).
+            config = try_get_optimal_moe_config(
+                w1_shape=self._mova_w1_shape,
+                w2_shape=torch.Size(
+                    [
+                        self._mova_w1_shape[0],
+                        self._mova_w1_shape[2],
+                        self._mova_w1_shape[1],
+                    ]
+                ),
+                top_k=self.num_experts_per_tok,
+                dtype=_get_config_dtype_str(
+                    use_fp8_w8a8=False,
+                    use_int8_w8a16=False,
+                    use_int4_w4a16=True,
+                    dtype=self._mova_config_dtype,
+                ),
+                M=hidden_states.size(0),
+                block_shape=block_shape,
+            )
+            return fused_mova_impl(
+                config=config,
+                hidden_states=hidden_states.contiguous(),
+                w1=self.v_experts_qweight,
+                topk_weights=routing_weights.contiguous(),
+                topk_ids=selected_values.contiguous(),
+                use_int4_w4a16=True,
+                w1_scale=self.v_experts_scale,
+                w1_zp=self.v_experts_zp,
+                block_shape=block_shape,
+                global_num_experts=self.num_experts,
+                expert_map=None,
+            )
 
         w1 = torch.stack(
             [expert.weight for expert in self.v_experts], dim=0
@@ -1439,7 +1562,13 @@ class K2HorizonForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        # Checkpoints may quantize self_attn.v_experts.*; fold them into the
+        # fused-MoE int4 layout before quant methods post-process the layers.
+        for module in list(self.modules()):
+            if isinstance(module, K2HorizonMoVAAttention):
+                module.pack_quantized_v_experts()
+        return loaded
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
