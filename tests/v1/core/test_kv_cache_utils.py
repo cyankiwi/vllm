@@ -2438,6 +2438,109 @@ def test_get_kv_cache_config_kpool_tail_coowns_indexer_tensor():
     )
 
 
+def _glm5_like_kv_cache_spec_with_dflash2() -> dict[str, KVCacheSpec]:
+    kv_cache_spec = _glm5_like_kv_cache_spec_with_tail()
+    for i in range(5):
+        kv_cache_spec[f"draft.layers.{i}.attn"] = SlidingWindowSpec(
+            block_size=1024,
+            num_kv_heads=4,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=2048,
+        )
+    return kv_cache_spec
+
+
+def test_get_kv_cache_config_glm5_slot_shares_dflash2_bf16(monkeypatch):
+    model_config = ModelConfig(max_model_len=8192)
+    vllm_config = VllmConfig(model_config=model_config)
+    kv_cache_spec = _glm5_like_kv_cache_spec_with_dflash2()
+
+    assert (
+        kv_cache_utils._get_kv_cache_groups_glm5_next(
+            vllm_config, kv_cache_spec
+        )
+        is None
+    )
+    vllm_config.speculative_config = SimpleNamespace(
+        method="mtp", use_eagle_block_drop=lambda: False
+    )
+    assert (
+        kv_cache_utils._get_kv_cache_groups_glm5_next(
+            vllm_config, kv_cache_spec
+        )
+        is None
+    )
+    vllm_config.speculative_config = SimpleNamespace(
+        method="dflash", use_eagle_block_drop=lambda: True
+    )
+    monkeypatch.setattr(kv_cache_utils.current_platform, "is_cuda", lambda: True)
+
+    groups = get_kv_cache_groups(vllm_config, kv_cache_spec)
+    draft_group = next(
+        group
+        for group in groups
+        if type(group.kv_cache_spec) is SlidingWindowSpec
+    )
+    assert draft_group.layer_names == [
+        f"draft.layers.{i}.attn" for i in range(5)
+    ]
+    assert draft_group.is_eagle_group
+
+    mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
+    original_draft = cast(
+        SlidingWindowSpec, kv_cache_spec["draft.layers.0.attn"]
+    )
+    fitted_draft = cast(SlidingWindowSpec, draft_group.kv_cache_spec)
+    assert original_draft.block_size == 1024
+    assert original_draft.page_size_padded is None
+    assert fitted_draft.block_size == 512
+    assert fitted_draft.page_size_padded == mla_page
+    assert fitted_draft.unpadded_page_size_bytes <= mla_page
+
+    layout = kv_cache_utils._glm5_next_tensor_layout(groups)
+    assert layout is not None
+    assert draft_group in layout[1]
+    target_groups = get_kv_cache_groups(
+        VllmConfig(model_config=ModelConfig(max_model_len=8192)),
+        _glm5_like_kv_cache_spec_with_tail(),
+    )
+    bytes_per_block = kv_cache_utils._pool_bytes_per_block(groups)
+    assert bytes_per_block == kv_cache_utils._pool_bytes_per_block(target_groups)
+
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, bytes_per_block * 100 + 1
+    )
+    assert kv_cache_config.num_blocks == 100
+    tensors = _tensor_by_layer(kv_cache_config)
+    for i in range(5):
+        assert (
+            tensors[f"draft.layers.{i}.attn"].offset
+            == tensors[f"layers.{4 * i + 3}.attn"].offset
+        )
+    assert {tensor.size for tensor in kv_cache_config.kv_cache_tensors} == {
+        bytes_per_block * 100
+    }
+    assert kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config, groups
+    ) > kv_cache_utils._max_memory_usage_bytes_from_groups(
+        vllm_config, target_groups
+    )
+
+
+def test_glm5_target_only_grouping_ignores_mtp_speculative_config():
+    kv_cache_spec = _glm5_like_kv_cache_spec_with_tail()
+    no_spec = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    mtp = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    mtp.speculative_config = SimpleNamespace(
+        method="mtp", use_eagle_block_drop=lambda: False
+    )
+
+    assert get_kv_cache_groups(mtp, kv_cache_spec) == get_kv_cache_groups(
+        no_spec, kv_cache_spec
+    )
+
+
 def test_glm5_kpool_tail_does_not_drag_hash_block_size():
     """The tail's kpool-sized scratch block (4 tokens) must not constrain the
     prefix-cache hash granularity: participating groups alone decide it."""

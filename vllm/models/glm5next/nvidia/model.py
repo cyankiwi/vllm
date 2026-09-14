@@ -63,9 +63,11 @@ from vllm.model_executor.models.glm4_1v import (
     Glm4vForConditionalGeneration,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -481,7 +483,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
-            x = sp_all_gather(x)[: positions.shape[0]]
+            x = sp_all_gather(x)[: positions.shape[-1]]
 
         x = self.self_attn(
             hidden_states=x,
@@ -585,7 +587,7 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
 
-class Glm5NextModel(nn.Module):
+class Glm5NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -670,7 +672,7 @@ class Glm5NextModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -688,13 +690,27 @@ class Glm5NextModel(nn.Module):
             post = None
             comb = None
 
-        full_num_tokens = positions.shape[0]
+        full_num_tokens = hidden_states.shape[0]
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
-        for layer in self._active_layers:
+        aux_hidden_states: list[torch.Tensor] = []
+        capture_layers = self.aux_hidden_state_layers
+        for layer_idx, layer in enumerate(self._active_layers, self.start_layer):
+            if layer_idx in capture_layers:
+                aux_hidden_states.append(
+                    self._aux_hidden_state(
+                        layer_idx, hidden_states, residual, post, comb, full_num_tokens
+                    )
+                )
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
+            )
+        if self.end_layer in capture_layers:
+            aux_hidden_states.append(
+                self._aux_hidden_state(
+                    self.end_layer, hidden_states, residual, post, comb, full_num_tokens
+                )
             )
 
         if not get_pp_group().is_last_rank:
@@ -711,7 +727,31 @@ class Glm5NextModel(nn.Module):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
+
+    def _aux_hidden_state(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        post: torch.Tensor | None,
+        comb: torch.Tensor | None,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Return the residual stream entering ``layer_idx`` for DFlash."""
+        if post is not None:
+            assert residual is not None and comb is not None
+            prev = self.layers[layer_idx - 1]
+            value = hc_contract(
+                prev.hc_post(hidden_states, residual, post, comb), prev.n
+            )
+        else:
+            value = hidden_states
+        if self.is_sequence_parallel:
+            value = sp_all_gather(value)[:num_tokens]
+        return value
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -924,7 +964,7 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForCausalLM(
-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
+    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
 ):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
     hf_to_vllm_mapper = WeightsMapper(
@@ -968,7 +1008,7 @@ class Glm5NextForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
@@ -1029,7 +1069,11 @@ class Glm5NextForCausalLM(
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
+    Glm4vForConditionalGeneration,
+    HasInnerState,
+    IsHybrid,
+    MixtureOfExperts,
+    SupportsEagle3,
 ):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
     hf_to_vllm_mapper = WeightsMapper(
