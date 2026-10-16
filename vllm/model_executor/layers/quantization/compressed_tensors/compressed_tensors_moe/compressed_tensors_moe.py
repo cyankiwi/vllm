@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import (
     QuantizationStrategy,
@@ -13,6 +12,7 @@ from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
+    RoutedExperts,
     UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
@@ -27,21 +27,19 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
     @staticmethod
     def get_moe_method(
         quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
-        layer: torch.nn.Module,
+        layer: RoutedExperts,
         layer_name: str,
     ) -> FusedMoEMethodBase:
         # RoutedExperts was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
-        unfused_names = [
-            f"{layer_name}.0.{proj_name}"
-            for proj_name in (
-                layer.ckpt_gate_proj_name,
-                layer.ckpt_up_proj_name,
-                layer.ckpt_down_proj_name,
-            )
-        ]
-        # TODO: refactor this to use expert_mapping and check all layer numbers
+        projections = RoutedExperts.get_checkpoint_projection_mapping(
+            layer.ckpt_gate_proj_name,
+            layer.ckpt_down_proj_name,
+            layer.ckpt_up_proj_name,
+        )
+        unfused_names = [f"{layer_name}.0.{name}" for _, name in projections]
+        # TODO: check all experts, not just expert 0.
         all_scheme_dicts = [
             quant_config.get_scheme_dict(layer, name) for name in unfused_names
         ]
@@ -51,7 +49,8 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         if not all([cur_dict == scheme_dict for cur_dict in all_scheme_dicts]):
             raise ValueError(
                 "All MoE projections need to have same "
-                "quantization scheme but found multiple"
+                "quantization scheme but found multiple "
+                f"for {layer_name}: {', '.join(unfused_names)}"
             )
 
         if scheme_dict is None:  # ignored layer

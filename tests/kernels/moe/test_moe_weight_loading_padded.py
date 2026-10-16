@@ -467,6 +467,34 @@ class TestUnquantizedTrtLlmPrePadding:
         assert intermediate == expected
 
 
+@pytest.mark.parametrize(
+    "ckpt_names,projections",
+    [
+        (("up_proj", "down_proj", None), [("w1", "up_proj"), ("w2", "down_proj")]),
+        (
+            ("gate_proj", "down_proj", "up_proj"),
+            [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")],
+        ),
+        (("w1", "w2", "w3"), [("w1", "w1"), ("w2", "w2"), ("w3", "w3")]),
+    ],
+)
+def test_expert_mapping_preserves_present_projection_names(ckpt_names, projections):
+    """Non-gated checkpoints omit w3; actual names and shard order stay intact."""
+    mapping = RoutedExperts.build_expert_params_mapping(
+        *ckpt_names, num_experts=2, routed_experts_prefix=""
+    )
+    assert mapping == [
+        (
+            "experts.w2_" if shard == "w2" else "experts.w13_",
+            f"experts.{expert}.{name}.",
+            expert,
+            shard,
+        )
+        for expert in range(2)
+        for shard, name in projections
+    ]
+
+
 class TestLoadWeightsExpertBias:
     """Some quantized exports (e.g. GPTQ, llm-compressor NVFP4) materialize
     all-zero per-expert `.bias` tensors for models whose experts have no bias

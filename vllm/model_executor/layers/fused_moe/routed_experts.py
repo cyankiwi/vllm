@@ -1153,6 +1153,23 @@ class RoutedExperts(PluggableLayer):
         )
 
     @staticmethod
+    def get_checkpoint_projection_mapping(
+        ckpt_gate_proj_name: str,
+        ckpt_down_proj_name: str,
+        ckpt_up_proj_name: str | None,
+    ) -> tuple[tuple[str, str], ...]:
+        """Map present checkpoint projections to fused expert shards."""
+        return tuple(
+            (shard_id, name)
+            for shard_id, name in (
+                ("w1", ckpt_gate_proj_name),
+                ("w2", ckpt_down_proj_name),
+                ("w3", ckpt_up_proj_name),
+            )
+            if name is not None
+        )
+
+    @staticmethod
     def build_expert_params_mapping(
         ckpt_gate_proj_name: str,
         ckpt_down_proj_name: str,
@@ -1265,6 +1282,9 @@ class RoutedExperts(PluggableLayer):
                     for shard_id in ("w1", "w3")
                 )
 
+        projections = RoutedExperts.get_checkpoint_projection_mapping(
+            ckpt_gate_proj_name, ckpt_down_proj_name, ckpt_up_proj_name
+        )
         per_expert_mapping = [
             # (param_name, weight_name, expert_id, shard_id)
             (
@@ -1274,12 +1294,7 @@ class RoutedExperts(PluggableLayer):
                 shard_id,
             )
             for expert_id in range(num_physical_experts)
-            for shard_id, weight_name in [
-                ("w1", ckpt_gate_proj_name),
-                ("w2", ckpt_down_proj_name),
-                ("w3", ckpt_up_proj_name),
-            ]
-            if weight_name is not None
+            for shard_id, weight_name in projections
         ]
 
         return fused_mapping + per_expert_mapping

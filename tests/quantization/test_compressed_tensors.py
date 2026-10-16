@@ -1023,6 +1023,69 @@ def test_compressed_tensors_mxfp4(vllm_runner):
         assert output
 
 
+@pytest.mark.parametrize(
+    "ckpt_names",
+    [
+        ("up_proj", "down_proj", None),
+        ("gate_proj", "down_proj", "up_proj"),
+        ("w1", "w2", "w3"),
+    ],
+)
+@pytest.mark.parametrize("mode", ["quantized", "ignored", "mixed"])
+def test_moe_scheme_checks_only_present_checkpoint_projections(
+    monkeypatch, ckpt_names, mode
+):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+        compressed_tensors_moe as moe,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+        compressed_tensors_moe_wna16 as wna16,
+    )
+
+    prefix = "model.layers.0.mlp.experts"
+    names = [name for name in ckpt_names if name is not None]
+    ignored = names if mode == "ignored" else [ckpt_names[1]] if mode == "mixed" else []
+    config = CompressedTensorsConfig.from_config(
+        {
+            "format": "pack-quantized",
+            "ignore": [f"{prefix}.0.{name}" for name in ignored],
+            "config_groups": {
+                "group_0": {
+                    "targets": [rf"re:.*experts\.\d+\.({'|'.join(names)})$"],
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "int",
+                        "strategy": "group",
+                        "group_size": 32,
+                        "symmetric": False,
+                    },
+                },
+            },
+        }
+    )
+    layer = torch.nn.Module()
+    layer.ckpt_gate_proj_name, layer.ckpt_down_proj_name, layer.ckpt_up_proj_name = (
+        ckpt_names
+    )
+    layer.moe_config = object()
+    quantized, unquantized = object(), object()
+    monkeypatch.setattr(wna16, "CompressedTensorsWNA16MoEMethod", lambda *a: quantized)
+    monkeypatch.setattr(moe, "UnquantizedFusedMoEMethod", lambda *a: unquantized)
+    lookup = Mock(wraps=config.get_scheme_dict)
+    monkeypatch.setattr(config, "get_scheme_dict", lookup)
+
+    if mode == "mixed":
+        with pytest.raises(ValueError, match="same quantization scheme") as error:
+            moe.CompressedTensorsMoEMethod.get_moe_method(config, layer, prefix)
+        assert prefix in str(error.value)
+    else:
+        method = moe.CompressedTensorsMoEMethod.get_moe_method(config, layer, prefix)
+        assert method is (unquantized if mode == "ignored" else quantized)
+    assert sorted(call.args[1] for call in lookup.call_args_list) == sorted(
+        f"{prefix}.0.{name}" for name in names
+    )
+
+
 def _mxfp4_moe_layer(monkeypatch, input_activations):
     from types import SimpleNamespace
 
