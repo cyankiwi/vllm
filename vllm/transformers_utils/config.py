@@ -169,6 +169,7 @@ _CONFIG_REGISTRY: dict[str, type[PreTrainedConfig]] = LazyConfigDict(
     speculators="SpeculatorsConfig",
     openvla="OpenVLAConfig",
     ovis="OvisConfig",
+    sensenova_loop="SenseNovaLoopConfig",
     ultravox="UltravoxConfig",
     step3_vl="Step3VLConfig",
     step3_text="Step3TextConfig",

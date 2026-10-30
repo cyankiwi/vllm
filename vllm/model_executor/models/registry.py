@@ -213,6 +213,10 @@ _TEXT_GENERATION_MODELS = {
     "RicursiveForCausalLM": ("ricursive", "RicursiveForCausalLM"),
     "SarvamMoEForCausalLM": ("sarvam", "SarvamMoEForCausalLM"),
     "SarvamMLAForCausalLM": ("sarvam", "SarvamMLAForCausalLM"),
+    "SenseNovaLoopForConditionalGeneration": (
+        "sensenova_loop",
+        "SenseNovaLoopForConditionalGeneration",
+    ),
     "Step1ForCausalLM": ("step1", "Step1ForCausalLM"),
     "Step3TextForCausalLM": ("step3_text", "Step3TextForCausalLM"),
     "Step3p5ForCausalLM": ("step3p5", "Step3p5ForCausalLM"),
