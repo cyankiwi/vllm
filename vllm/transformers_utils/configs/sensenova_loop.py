@@ -19,7 +19,7 @@ class SenseNovaLoopConfig(Qwen3_5Config):
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        if self.architectures == ["Qwen3_5LoopForConditionalGeneration"]:
+        if self.architectures == ["Qwen3_5LoopForConditionalGeneration"]:  # type: ignore[has-type]
             self.architectures = ["SenseNovaLoopForConditionalGeneration"]
         self.loop_settings = loop_settings
         self.mhc = mhc
