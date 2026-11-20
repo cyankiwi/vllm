@@ -468,6 +468,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 )
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
     supports_multimodal_pruning = True
+    language_model_cls = Qwen3_5ForCausalLM
 
     hf_to_vllm_mapper = (
         Qwen3VLForConditionalGeneration.hf_to_vllm_mapper
@@ -516,7 +517,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             )
 
         with self._mark_language_model(vllm_config):
-            self.language_model = Qwen3_5ForCausalLM(
+            self.language_model = self.language_model_cls(
                 vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
             )
 
