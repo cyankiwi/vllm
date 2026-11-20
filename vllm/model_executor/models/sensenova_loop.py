@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Text inference for fixed-count SenseNova Loop checkpoints with optional mHC."""
+"""Multimodal inference for fixed-count SenseNova Loop checkpoints with optional mHC."""
 
 from collections.abc import Iterable
 
@@ -10,7 +10,6 @@ from torch.nn import functional as F
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.sensenova_loop_mhc import MHCRouter
@@ -19,16 +18,43 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import HasInnerState, IsHybrid, SupportsMRoPE
 from .qwen3_5 import (
     Qwen3_5DecoderLayer,
-    Qwen3_5ForCausalLMBase,
+    Qwen3_5ForConditionalGeneration,
     Qwen3_5Model,
+    Qwen3_5ProcessingInfo,
     Qwen3_5RMSNorm,
+    Qwen3VLDummyInputsBuilder,
+    Qwen3VLMultiModalProcessor,
 )
-from .utils import AutoWeightsLoader, maybe_prefix
+from .utils import (
+    AutoWeightsLoader,
+    make_empty_intermediate_tensors_factory,
+    maybe_prefix,
+)
+
+
+def _expand_layer_name(
+    name: str, destinations: dict[int, list[int]], prefix: str = "language_model.model"
+) -> Iterable[str]:
+    """Map a physical layer name to the names of all execution layers using it."""
+    layers = f"{prefix}.layers."
+    if not name.startswith(layers):
+        yield name
+        return
+    index, suffix = name.removeprefix(layers).split(".", 1)
+    for execution in destinations[int(index)]:
+        yield f"{layers}{execution}.{suffix}"
+
+
+def _loop_destinations(indices: Iterable[int]) -> dict[int, list[int]]:
+    destinations: dict[int, list[int]] = {}
+    for execution, physical in enumerate(indices):
+        destinations.setdefault(physical, []).append(execution)
+    return destinations
 
 
 class SenseNovaLoopAWQEmbeddingMethod(QuantizeMethodBase):
@@ -207,102 +233,74 @@ class SenseNovaLoopModel(nn.Module):
         )
 
 
-class SenseNovaLoopForConditionalGeneration(
-    nn.Module, HasInnerState, IsHybrid, SupportsMRoPE
-):
-    packed_modules_mapping = Qwen3_5ForCausalLMBase.packed_modules_mapping
-
-    @classmethod
-    def get_mamba_state_dtype_from_config(
-        cls, vllm_config: VllmConfig
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return Qwen3_5ForCausalLMBase.get_mamba_state_dtype_from_config(vllm_config)
-
-    @classmethod
-    def get_mamba_state_shape_from_config(
-        cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        return Qwen3_5ForCausalLMBase.get_mamba_state_shape_from_config(vllm_config)
-
-    @classmethod
-    def get_mamba_state_copy_func(
-        cls,
-    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
-        return Qwen3_5ForCausalLMBase.get_mamba_state_copy_func()
-
-    get_mrope_input_positions = Qwen3_5ForCausalLMBase.get_mrope_input_positions
-
+class SenseNovaLoopForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.config = self.model_config.hf_text_config
-        if (
-            vllm_config.parallel_config.pipeline_parallel_size != 1
-            or vllm_config.speculative_config is not None
-            or vllm_config.lora_config is not None
-            or getattr(self.config, "layer_scale", False)
-        ):
-            raise ValueError(
-                "SenseNova Loop currently requires text inference "
-                "without pipeline parallelism, LoRA, speculation or layer_scale"
-            )
-        self.quant_config = vllm_config.quant_config
-        if self.quant_config is not None and not isinstance(
-            self.quant_config, AutoAWQConfig
-        ):
-            raise ValueError("SenseNova Loop supports only unquantized and AWQ weights")
-        self.scheduler_config = vllm_config.scheduler_config
+        self.config = vllm_config.model_config.hf_text_config
         self.model = SenseNovaLoopModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
-            quant_config=self.quant_config,
+            quant_config=vllm_config.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         if self.config.tie_word_embeddings:
             self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], self.config.hidden_size
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **kwargs: object,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
-
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        destinations: dict[int, list[int]] = {}
-        for execution, physical in enumerate(self.config.loop_physical_indices):
-            destinations.setdefault(physical, []).append(execution)
+    def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
+
+@MULTIMODAL_REGISTRY.register_processor(
+    Qwen3VLMultiModalProcessor,
+    info=Qwen3_5ProcessingInfo,
+    dummy_inputs=Qwen3VLDummyInputsBuilder,
+)
+class SenseNovaLoopForConditionalGeneration(Qwen3_5ForConditionalGeneration):
+    language_model_cls = SenseNovaLoopForCausalLM
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        config = vllm_config.model_config.hf_text_config
+        spec_config = vllm_config.speculative_config
+        if (
+            vllm_config.parallel_config.pipeline_parallel_size != 1
+            or (spec_config is not None and spec_config.method != "mtp")
+            or vllm_config.lora_config is not None
+            or getattr(config, "layer_scale", False)
+        ):
+            raise ValueError(
+                "SenseNova Loop does not support pipeline parallelism, LoRA, "
+                "layer_scale, or speculative methods other than MTP"
+            )
+        self.loop_destinations = _loop_destinations(config.loop_physical_indices)
+        quant_config = vllm_config.quant_config
+        if quant_config is not None and not isinstance(quant_config, AutoAWQConfig):
+            raise ValueError("SenseNova Loop supports only unquantized and AWQ weights")
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def expanded_weights() -> Iterable[tuple[str, torch.Tensor]]:
-            for name, weight in weights:
-                name = name.replace("model.language_model.", "model.", 1)
-                if name == "model.loop_gate.logits":
+            for name, weight in self.hf_to_vllm_mapper.apply(weights):
+                if name == "language_model.model.loop_gate.logits":
                     continue
-                if name.startswith(("model.visual.", "visual.", "mtp.")):
-                    continue
-                if name.startswith("model.layers."):
-                    _, _, index, suffix = name.split(".", 3)
-                    for execution in destinations[int(index)]:
-                        yield f"model.layers.{execution}.{suffix}", weight
-                else:
-                    yield name, weight
+                for execution_name in _expand_layer_name(name, self.loop_destinations):
+                    yield execution_name, weight
 
         return AutoWeightsLoader(self).load_weights(expanded_weights())
 
     def process_weights_after_loading(self) -> None:
         # Parameters share storage; attention modules and their caches stay distinct.
-        self.model.share_loop_parameters()
+        if isinstance(self.language_model, SenseNovaLoopForCausalLM):
+            self.language_model.model.share_loop_parameters()

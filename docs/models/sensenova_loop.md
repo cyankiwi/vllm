@@ -1,6 +1,6 @@
 # SenseNova Loop with mHC
 
-The `SenseNovaLoopForConditionalGeneration` implementation serves text from
+The `SenseNovaLoopForConditionalGeneration` implementation serves text and image inputs from
 the public [SenseNova-Loop-9B-Preview](https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview)
 checkpoint and compatible `sensenova_loop` checkpoints. It uses a fixed
 `loop_settings.eval_count`, shares repeated layer parameters, and keeps separate
@@ -9,15 +9,16 @@ routers retain FP32 weights and use log-space Sinkhorn normalization.
 
 The implementation supports unquantized weights and the official
 [SenseNova-Loop-9B-AWQ](https://huggingface.co/sensenova/SenseNova-Loop-9B-AWQ)
-checkpoint for text generation. The AWQ loader keeps the decoder projections,
+checkpoint. The AWQ loader keeps the decoder projections,
 token embedding and output head packed in 4-bit weights. The checkpoint's
 DeltaNet gates and mHC routers retain their original precision.
 
 On NVIDIA GPUs, the implementation defaults to
 full decode CUDA Graphs without Torch compilation; prefill executes eagerly.
 Explicit compilation settings and `--enforce-eager` take precedence.
-It supports tensor parallelism, but not pipeline parallelism, vision, audio,
-LoRA, speculative decoding, learned loop gates, or layer scaling. CPU weight
+It supports tensor parallelism and MTP speculative decoding with the
+checkpoint's `mtp.*` weights, but not pipeline parallelism, audio, LoRA, other
+speculative methods, learned loop gates, or layer scaling. CPU weight
 offloading is unsupported with shared loop weights: nonzero `--cpu-offload-gb`
 or `--offload-group-size` is rejected before workers start.
 The `sharded_state` and `runai_streamer_sharded` load formats are also rejected
@@ -44,8 +45,8 @@ vllm serve sensenova/SenseNova-Loop-9B-Preview \
 The public checkpoint loads natively without `--trust-remote-code` or
 architecture overrides. Its [reference implementation](https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview/blob/main/modeling_sensenova_loop.py)
 and weights are published under Apache 2.0. The checkpoint includes vision and
-MTP weights; this implementation loads the text backbone and mHC routers and
-ignores those additional weights. Image inputs and MTP remain unsupported.
+MTP weights; the vision tower loads with the text backbone, and the MTP weights
+load as the draft model when MTP speculative decoding is enabled.
 
 To serve the official AWQ checkpoint, let vLLM detect AWQ from its config:
 

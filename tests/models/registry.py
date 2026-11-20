@@ -558,11 +558,6 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         },
     ),
     "SeedOssForCausalLM": _HfExamplesInfo("ByteDance-Seed/Seed-OSS-36B-Instruct"),
-    "SenseNovaLoopForConditionalGeneration": _HfExamplesInfo(
-        "sensenova/SenseNova-Loop-9B-Preview",
-        max_model_len=4096,
-        max_num_seqs=2,
-    ),
     "SmolLM3ForCausalLM": _HfExamplesInfo("HuggingFaceTB/SmolLM3-3B"),
     "StableLmForCausalLM": _HfExamplesInfo("stabilityai/stablelm-3b-4e1t"),
     "Starcoder2ForCausalLM": _HfExamplesInfo("bigcode/starcoder2-3b"),
@@ -1405,6 +1400,11 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     ),
     "RForConditionalGeneration": _HfExamplesInfo(
         "vllm-project/R-4B", trust_remote_code=True
+    ),
+    "SenseNovaLoopForConditionalGeneration": _HfExamplesInfo(
+        "sensenova/SenseNova-Loop-9B-Preview",
+        max_model_len=4096,
+        max_num_seqs=2,
     ),
     "SkyworkR1VChatModel": _HfExamplesInfo(
         "Skywork/Skywork-R1V-38B",

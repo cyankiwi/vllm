@@ -1152,6 +1152,7 @@ class SpeculativeConfig:
             "qwen3_5_moe",
             "qwen3_5_text",
             "qwen3_5_moe_text",
+            "sensenova_loop",
         ):
             # Checkpoints that ship only the text config resolve to the
             # `qwen3_5_text` / `qwen3_5_moe_text` model types and carry the
