@@ -7,9 +7,11 @@ checkpoint and compatible `sensenova_loop` checkpoints. It uses a fixed
 attention and recurrent caches for every execution of a layer. Optional mHC
 routers retain FP32 weights and use log-space Sinkhorn normalization.
 
-The implementation supports unquantized weights and the official
+The implementation supports unquantized weights, the official
 [SenseNova-Loop-9B-AWQ](https://huggingface.co/sensenova/SenseNova-Loop-9B-AWQ)
-checkpoint. The AWQ loader keeps the decoder projections,
+checkpoint, and compressed-tensors checkpoints. Compressed-tensors schemes and
+ignore entries name physical layers; each one applies to every execution of
+that layer. The AWQ loader keeps the decoder projections,
 token embedding and output head packed in 4-bit weights. The checkpoint's
 DeltaNet gates and mHC routers retain their original precision.
 

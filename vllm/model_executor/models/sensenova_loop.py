@@ -3,6 +3,7 @@
 """Multimodal inference for fixed-count SenseNova Loop checkpoints with optional mHC."""
 
 from collections.abc import Iterable
+from copy import copy
 
 import torch
 from torch import nn
@@ -12,6 +13,9 @@ from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsConfig,
+)
 from vllm.model_executor.layers.sensenova_loop_mhc import MHCRouter
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -286,8 +290,30 @@ class SenseNovaLoopForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             )
         self.loop_destinations = _loop_destinations(config.loop_physical_indices)
         quant_config = vllm_config.quant_config
-        if quant_config is not None and not isinstance(quant_config, AutoAWQConfig):
-            raise ValueError("SenseNova Loop supports only unquantized and AWQ weights")
+        if isinstance(quant_config, CompressedTensorsConfig):
+            # The loader has mapped the physical checkpoint paths to VL paths.
+            quant_config = copy(quant_config)
+            model_prefix = maybe_prefix(prefix, "language_model.model")
+            quant_config.target_scheme_map = {
+                execution_name: scheme
+                for name, scheme in quant_config.target_scheme_map.items()
+                for execution_name in _expand_layer_name(
+                    name, self.loop_destinations, model_prefix
+                )
+            }
+            quant_config.ignore = [
+                execution_name
+                for name in quant_config.ignore
+                for execution_name in _expand_layer_name(
+                    name, self.loop_destinations, model_prefix
+                )
+            ]
+            vllm_config = copy(vllm_config)
+            vllm_config.quant_config = quant_config
+        elif quant_config is not None and not isinstance(quant_config, AutoAWQConfig):
+            raise ValueError(
+                "SenseNova Loop supports only unquantized, AWQ and CT weights"
+            )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
