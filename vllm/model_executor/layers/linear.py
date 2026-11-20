@@ -44,6 +44,7 @@ from vllm.model_executor.parameter import (
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
+    SharedWeightParameter,
 )
 from vllm.model_executor.utils import copy_weight_, set_weight_attrs
 from vllm.platforms import current_platform
@@ -1007,22 +1008,24 @@ class MergedColumnParallelLinear(StackedColumnParallelLinear):
         self.validate_shard_id(loaded_shard_id, param)
         self._zero_output_padding(param)
         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
-            if isinstance(param, PerTensorScaleParameter):
+            # Per-tensor scales and shared (e.g. transform) matrices hold one
+            # whole value per shard rather than rows of the fused output.
+            if isinstance(param, (PerTensorScaleParameter, SharedWeightParameter)):
                 if isinstance(loaded_shard_id, tuple):
-                    for idx in loaded_shard_id:
-                        param.load_merged_column_weight(
-                            loaded_weight=loaded_weight, shard_id=idx
-                        )
+                    shard_ids = loaded_shard_id
+                elif isinstance(param, SharedWeightParameter):
+                    shard_ids = tuple(param.partitions)
                 else:
                     # When weights are already fused on disk (e.g. Phi-3's
                     # gate_up_proj), there is only a single scale for the
                     # entire fused matrix. Fill all slots with this scale
                     # to ensure that any subsequent reduction (like .max())
                     # works correctly while preserving the parameter shape.
-                    for idx in range(param.data.shape[0]):
-                        param.load_merged_column_weight(
-                            loaded_weight=loaded_weight, shard_id=idx
-                        )
+                    shard_ids = tuple(range(param.data.shape[0]))
+                for idx in shard_ids:
+                    param.load_merged_column_weight(
+                        loaded_weight=loaded_weight, shard_id=idx
+                    )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)

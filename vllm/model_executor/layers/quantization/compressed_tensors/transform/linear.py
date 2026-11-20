@@ -103,12 +103,16 @@ class CompressedTensorsLinearTransformMethod(LinearMethodBase):
             **extra_weight_attrs,
         )
 
-        # validate schemes
-        num_partitions = len(output_partition_sizes)
-        self._validate_tfm_schemes(num_partitions)
+        self._validate_tfm_schemes()
 
         # create submodules for weight loading
         if len(self.input_tfms) > 0:
+            # Every output partition reads the same input, so each gets the
+            # (identical) input transform, even where one checkpoint shard
+            # feeds several partitions (Qwen3.5's in_proj_qkv -> q, k, v).
+            self.input_tfms = dict.fromkeys(
+                range(len(output_partition_sizes)), self.input_tfms[0]
+            )
             scheme_name = list(self.input_tfms.values())[0].scheme_name
             location = list(self.input_tfms.values())[0].args.location
             transform_name = f"{scheme_name}_{location}"
@@ -171,14 +175,11 @@ class CompressedTensorsLinearTransformMethod(LinearMethodBase):
 
         return x
 
-    def _validate_tfm_schemes(self, num_partitions: int):
-        if len(self.input_tfms) > 0:
-            if 0 not in self.input_tfms:
-                raise ValueError("Must have same input")
-
-            for part_index in range(num_partitions):
-                if self.input_tfms[part_index] != self.input_tfms[0]:
-                    raise ValueError("Must have same input")
+    def _validate_tfm_schemes(self):
+        if self.input_tfms and any(
+            tfm != self.input_tfms[0] for tfm in self.input_tfms.values()
+        ):
+            raise ValueError("All logical shards must use the same input transform")
 
         if len(self.output_tfms) > 0:
             scheme_name = list(self.output_tfms.values())[0].scheme_name
@@ -223,6 +224,9 @@ def get_linear_transform_schemes(
                     raise ValueError(
                         f"Cannot apply `{args.location}` transform to `{layer_name}`"
                     )
+
+    if input_tfms and len(input_tfms) != len(partition_names):
+        raise ValueError(f"Input transform must cover all logical shards: {layer_name}")
 
     return (input_tfms, output_tfms)
 
